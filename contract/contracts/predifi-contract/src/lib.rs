@@ -145,6 +145,28 @@ pub const MAX_RESOLUTION_DELAY: u64 = 2_592_000;
 /// Minimum claim window: 1 day in seconds
 pub const MIN_CLAIM_WINDOW: u64 = 86_400;
 
+/// Minimum retention period for unresolved claims: 30 days in seconds.
+///
+/// After a pool is resolved or canceled, its claimable state (pool record,
+/// outcome stakes, and per-user claim flags) MUST remain queryable and
+/// claimable for at least this long.  Storage archival/TTL logic must never
+/// evict entries required for claims before this window elapses.
+pub const MIN_CLAIM_RETENTION_PERIOD: u64 = 2_592_000;
+
+/// Default TTL (in ledgers) applied to temporary pool storage entries.
+///
+/// Temporary entries (e.g. transient per-pool scratch data) are extended by
+/// this amount on write and are allowed to expire once the pool is finalized
+/// and the retention window has passed.
+pub const TEMP_STORAGE_TTL_LEDGERS: u32 = 120_960;
+
+/// Default TTL (in ledgers) applied to persistent pool storage entries.
+///
+/// Persistent entries (pool records, outcome stakes, claim flags) are
+/// extended by this amount on every access so that they survive at least
+/// `MIN_CLAIM_RETENTION_PERIOD` after resolution.
+pub const PERSISTENT_STORAGE_TTL_LEDGERS: u32 = 535_680;
+
 /// Maximum claim window: 365 days in seconds
 pub const MAX_CLAIM_WINDOW: u64 = 31_536_000;
 

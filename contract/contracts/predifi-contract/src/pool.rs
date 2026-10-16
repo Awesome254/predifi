@@ -1,5 +1,8 @@
 //! Pool domain: prediction pool lifecycle — creation, configuration,
 //! resolution, cancellation and pool queries.
+//!
+//! Storage retention: see `RETENTION_*` constants and `bump_ttl` /
+//! `extend_persistent` / `extend_temporary` helpers in `lib.rs`.
 
 use soroban_sdk::{contractimpl, log, token, Address, Env, String, Symbol, Vec};
 
@@ -1390,6 +1393,35 @@ impl PredifiContract {
             .expect("Pool not found");
         Self::extend_persistent(&env, &pool_key);
         pool
+    }
+
+    /// Returns the ledger timestamp at which the pool's persistent storage
+    /// entries may be safely archived, or `None` if the pool is still
+    /// unresolved and therefore must be retained indefinitely.
+    ///
+    /// Retention policy:
+    /// - Active / Locked / Disputed pools: `None` (retained until resolution).
+    /// - Resolved / Canceled pools: `resolution_timestamp + RETENTION_CLAIM_WINDOW`
+    ///   so that users can still claim winnings or refunds during the promised
+    ///   claim window. After this point, off-chain indexers are expected to
+    ///   have archived the pool and its stakes; on-chain entries may be
+    ///   evicted by TTL expiry.
+    pub fn get_pool_retention_deadline(env: Env, pool_id: u64) -> Option<u64> {
+        let pool_key = DataKey::Pool(pool_id);
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .expect("Pool not found");
+        Self::extend_persistent(&env, &pool_key);
+
+        match pool.state {
+            MarketState::Active | MarketState::Locked | MarketState::Disputed => None,
+            MarketState::Resolved | MarketState::Canceled => {
+                let base = pool.resolution_timestamp.unwrap_or(pool.end_time);
+                Some(base.saturating_add(crate::RETENTION_CLAIM_WINDOW))
+            }
+        }
     }
 
     /// Returns the configuration fields of a pool as a `PoolConfig` struct.

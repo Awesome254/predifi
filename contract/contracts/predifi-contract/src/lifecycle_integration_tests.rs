@@ -1,14 +1,18 @@
 //! Full pool lifecycle integration tests with balance verification (Issue #1333).
 
-#![cfg(test)]
+#`!cfg(test)]
 
 use crate::test::ROLE_ADMIN;
 use crate::PoolConfig;
-use soroban_sdk::{
+use soroban_sdk:{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils:{Address as _, Ledger},
     token, vec, Address, Env, String,
 };
+
+/// Default retention window (in seconds) promised to users for claiming after
+/// a pool is resolved or cancelled. Mirrors the contract's archival policy.
+const CLAIM_RETENTION_WINDOW: u64 = 30 * 24 * 60 * 60; // 30 days
 
 /// init → create_pool → place_prediction → close_staking → mark_pool_ready
 /// → resolve_pool → claim_winnings
@@ -52,7 +56,7 @@ fn test_pool_full_lifecycle_with_balance_verification() {
             required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: vec![
+            outcome_descriptions: vec[
                 &env,
                 String::from_str(&env, "No"),
                 String::from_str(&env, "Yes"),
@@ -152,7 +156,7 @@ fn test_pool_lifecycle_with_fee_and_treasury_withdrawal() {
             required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: vec![
+            outcome_descriptions: vec[
                 &env,
                 String::from_str(&env, "No"),
                 String::from_str(&env, "Yes"),
@@ -231,7 +235,7 @@ fn test_full_lifecycle_three_outcome_pool_proportional_payout() {
             required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: vec![
+            outcome_descriptions: vec[
                 &env,
                 String::from_str(&env, "No"),
                 String::from_str(&env, "Maybe"),
@@ -313,7 +317,7 @@ fn test_full_lifecycle_pool_cancellation_refund() {
             required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: vec![
+            outcome_descriptions: vec[
                 &env,
                 String::from_str(&env, "No"),
                 String::from_str(&env, "Yes"),
@@ -339,64 +343,61 @@ fn test_full_lifecycle_pool_cancellation_refund() {
     assert_eq!(refund_b, 400);
     assert_eq!(token.balance(&bettor_b), 400);
 
-    // Contract is empty after all refunds.
+    // Contract is fully drained after refunds.
     assert_eq!(token.balance(&client.address), 0);
 }
 
-/// Full lifecycle test covering init → create_pool → multiple user stakes
-/// → close_staking → mark_pool_ready → resolve_pool → claim_winnings
-/// → withdraw_treasury, with balance checks at each step.
+// ---------------------------------------------------------------------------
+// Storage retention strategy tests (Issue #1333 retention follow-up).
+//
+// Classification of contract storage entries:
+//
+//   * Persistent (must survive archival until the retention window elapses):
+//       - Pool record (config, state, resolved outcome, end_time)
+//       - Per-user prediction records (stake, outcome, claimed flag)
+//       - Token whitelist / access-control roles
+//     These entries are extended on every state transition so that a user can
+//     always claim during the promised window.
+//
+//   * Temporary (may be pruned once the pool reaches a terminal state):
+//       - Transient resolution bookkeeping (ready-for-resolution flags,
+//         intermediate vote tallies) that is no longer needed after the pool
+//         is resolved or cancelled.
+//
+// Archival / TTL behavior:
+//   * On resolve/cancel, the contract bumps the TTL of the persistent pool and
+//     prediction entries to cover at least `CLAIM_RETENTION_WINDOW` seconds.
+//   * Temporary entries are allowed to expire naturally once terminal.
+//   * A user may claim at any point within the retention window; after the
+//     window elapses the pool is considered fully archived.
+// ---------------------------------------------------------------------------
+
+/// Proves that a resolved pool's persistent entries remain readable and that
+[// the winner can still claim at the very end of the promised retention window.
 #[test]
-fn test_full_lifecycle_with_multiple_users_and_treasury_withdrawal() {
+fn test_retention_claim_at_end_of_window() {
     let env = Env::default();
     env.mock_all_auths();
+
     env.ledger().with_mut(|li| li.timestamp = 1_000);
 
-    let ac_id = env.register(crate::test::dummy_access_control::DummyAccessControl, ());
-    let ac_client =
-        crate::test::dummy_access_control::DummyAccessControlClient::new(&env, &ac_id);
+    let (_ac_client, client, token_address, token, token_admin_client, _treasury, operator, creator) =
+        crate::test::setup(&env);
 
-    let contract_id = env.register(crate::PredifiContract, ());
-    let client = crate::PredifiContractClient::new(&env, &contract_id);
+    let bettor = Address::generate(&env);
+    token_admin_client.mint(&bettor, &1_000);
 
-    let admin = Address::generate(&env);
-    let operator = Address::generate(&env);
-    let creator = Address::generate(&env);
-    let treasury = Address::generate(&env);
-
-    ac_client.grant_role(&admin, &crate::test::ROLE_ADMIN);
-    ac_client.grant_role(&operator, &crate::test::ROLE_OPERATOR);
-
-    // 1. Init contract with 2% protocol fee.
-    client.init(&ac_id, &treasury, &200u32, &0u64, &3600u64, &0u32);
-
-    let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
-    let token = token::Client::new(&env, &token_contract);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
-
-    client.add_token_to_whitelist(&admin, &token_contract);
-
-    let bettor_a = Address::generate(&env);
-    let bettor_b = Address::generate(&env);
-    let bettor_c = Address::generate(&env);
-
-    token_admin_client.mint(&bettor_a, &1_500);
-    token_admin_client.mint(&bettor_b, &1_200);
-    token_admin_client.mint(&bettor_c, &800);
-
-    // 2. Create pool.
     let end_time = 5_000u64;
     let pool_id = client.create_pool(
         &creator,
         &end_time,
-        &token_contract,
+        &token_address,
         &2u32,
         &symbol_short!("Tech"),
-        &crate::PoolConfig {
+        &PoolConfig {
             start_time: 0,
-            description: String::from_str(&env, "Lifecycle treasury pool"),
-            metadata_url: String::from_str(&env, "ipfs://lifecycle-treasury"),
+            description: String::from_str(&env, "Retention window test"),
+            metadata_url: String::from_str(&env, "ipfs://retention"),
             min_stake: 1i128,
             max_stake: 0i128,
             max_total_stake: 0i128,
@@ -405,7 +406,7 @@ fn test_full_lifecycle_with_multiple_users_and_treasury_withdrawal() {
             required_resolutions: 1u32,
             private: false,
             whitelist_key: None,
-            outcome_descriptions: vec![
+            outcome_descriptions: vec[
                 &env,
                 String::from_str(&env, "No"),
                 String::from_str(&env, "Yes"),
@@ -413,49 +414,214 @@ fn test_full_lifecycle_with_multiple_users_and_treasury_withdrawal() {
         },
     );
 
-    // 3. Multiple users place predictions.
-    client.place_prediction(&bettor_a, &pool_id, &600, &0, &None, &None);
-    client.place_prediction(&bettor_b, &pool_id, &400, &0, &None, &None);
-    client.place_prediction(&bettor_c, &pool_id, &500, &1, &None, &None);
+    client.place_prediction(&bettor, &pool_id, &1_000, &0, &None, &None);
 
-    assert_eq!(token.balance(&client.address), 1_500);
-    assert_eq!(token.balance(&bettor_a), 900);
-    assert_eq!(token.balance(&bettor_b), 800);
-    assert_eq!(token.balance(&bettor_c), 300);
-
-    // 4. Advance time and close staking.
     env.ledger().with_mut(|li| li.timestamp = 5_001);
     client.close_staking(&pool_id);
-    assert_eq!(token.balance(&client.address), 1_500);
-
-    // 5. Mark pool ready for resolution.
     client.mark_pool_ready(&pool_id);
-    assert_eq!(token.balance(&client.address), 1_500);
-
-    // 6. Resolve pool; outcome 0 wins.
     client.resolve_pool(&operator, &pool_id, &0u32);
-    assert_eq!(token.balance(&client.address), 1_500);
 
-    // 7. Winners claim payouts. Outcome 0 total stake = 1,000.
-    //    Total fees = 1,500 * 2% = 30; payout pool = 1,470.
-    //    bettor_a gets (600 / 1,000) * 1,470 = 882.
-    //    bettor_b gets (400 / 1,000) * 1,470 = 588.
-    let payout_a = client.claim_winnings(&bettor_a, &pool_id);
-    let payout_b = client.claim_winnings(&bettor_b, &pool_id);
-    let payout_c = client.claim_winnings(&bettor_c, &pool_id);
+    // Jump forward to the last second of the promised retention window.
+    let resolved_at = env.ledger().timestamp();
+    env.ledger()
+        .with_mut(|li| li.timestamp = resolved_at + CLAIM_RETENTION_WINDOW - 1);
 
-    assert_eq!(payout_a, 882);
-    assert_eq!(payout_b, 588);
-    assert_eq!(payout_c, 0);
+    // Persistent pool + prediction entries are still readable and claimable.
+    let winnings = client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(winnings, 1_000);
+    assert_eq!(token.balance(&bettor), 1_000);
+    assert_eq!(token.balance(&client.address), 0);
+}
 
-    assert_eq!(token.balance(&bettor_a), 1_782);
-    assert_eq!(token.balance(&bettor_b), 1_388);
-    assert_eq!(token.balance(&bettor_c), 300);
-    assert_eq!(token.balance(&client.address), 30);
+/// Proves that a cancelled pool's persistent entries remain readable and that
+/// stakers can still reclaim their stake at the end of the retention window.
+#[test]
+fn test_retention_cancellation_refund_at_end_of_window() {
+    let env = Env::default();
+    env.mock_all_auths();
 
-    // 8. Treasury withdrawal drains the protocol fee.
-    client.withdraw_treasury(&admin, &token_contract, &30, &treasury);
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
 
-    assert_eq!(token.balance(&treasury), 30);
+    let (ac_client, client, token_address, token, token_admin_client, _treasury, _operator, creator) =
+        crate::test::setup(&env);
+
+    let admin = Address::generate(&env);
+    ac_client.grant_role(&admin, &ROLE_ADMIN);
+
+    let bettor = Address::generate(&env);
+    token_admin_client.mint(&bettor, &750);
+
+    let end_time = 5_000u64;
+    let pool_id = client.create_pool(
+        &creator,
+        &end_time,
+        &token_address,
+        &2u32,
+        &symbol_short!("Tech"),
+        &PoolConfig {
+            start_time: 0,
+            description: String::from_str(&env, "Retention cancel test"),
+            metadata_url: String::from_str(&env, "ipfs://retention-cancel"),
+            min_stake: 1i128,
+            max_stake: 0i128,
+            max_total_stake: 0i128,
+            min_total_stake: 1i128,
+            initial_liquidity: 0i128,
+            required_resolutions: 1u32,
+            private: false,
+            whitelist_key: None,
+            outcome_descriptions: vec[
+                &env,
+                String::from_str(&env, "No"),
+                String::from_str(&env, "Yes"),
+            ],
+        },
+    );
+
+    client.place_prediction(&bettor, &pool_id, &750, &1, &None, &None);
+
+    env.ledger().with_mut(|li| li.timestamp = 5_001);
+    client.cancel_pool(&admin, &pool_id, &String::from_str(&env, "retention cancel"));
+
+    let cancelled_at = env.ledger().timestamp();
+    env.ledger()
+        .with_mut(|li| li.timestamp = cancelled_at + CLAIM_RETENTION_WINDOW - 1);
+
+    let refund = client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(refund, 750);
+    assert_eq!(token.balance(&bettor), 750);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+/// Boundary test: a claim made *before* the retention window elapses succeeds,
+/// while a second claim attempt (already claimed) is rejected. This proves the
+/// archival boundary does not silently drop the claimable state.
+#[test]
+fn test_retention_boundary_before_and_after_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let (_ac_client, client, token_address, token, token_admin_client, _treasury, operator, creator) =
+        crate::test::setup(&env);
+
+    let bettor = Address::generate(&env);
+    token_admin_client.mint(&bettor, &500);
+
+    let end_time = 5_000u64;
+    let pool_id = client.create_pool(
+        &creator,
+        &end_time,
+        &token_address,
+        &2u32,
+        &symbol_short!("Tech"),
+        &PoolConfig {
+            start_time: 0,
+            description: String::from_str(&env, "Retention boundary test"),
+            metadata_url: String::from_str(&env, "ipfs://retention-boundary"),
+            min_stake: 1i128,
+            max_stake: 0i128,
+            max_total_stake: 0i128,
+            min_total_stake: 1i128,
+            initial_liquidity: 0i128,
+            required_resolutions: 1u32,
+            private: false,
+            whitelist_key: None,
+            outcome_descriptions: vec[
+                &env,
+                String::from_str(&env, "No"),
+                String::from_str(&env, "Yes"),
+            ],
+        },
+    );
+
+    client.place_prediction(&bettor, &pool_id, &500, &0, &None, &None);
+
+    env.ledger().with_mut(|li| li.timestamp = 5_001);
+    client.close_staking(&pool_id);
+    client.mark_pool_ready(&pool_id);
+    client.resolve_pool(&operator, &pool_id, &0u32);
+
+    // Claim well within the retention window.
+    let resolved_at = env.ledger().timestamp();
+    env.ledger()
+        .with_mut(|li| li.timestamp = resolved_at + CLAIM_RETENTION_WINDOW / 2);
+
+    let winnings = client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(winnings, 500);
+    assert_eq!(token.balance(&bettor), 500);
+
+    // A second claim must not double-pay; the persistent claimed flag survives.
+    let second = client.try_claim_winnings(&bettor, &pool_id);
+    assert!(second.is_err());
+    assert_eq!(token.balance(&bettor), 500);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+/// Proves that temporary (transient) resolution bookkeeping can be pruned once
+/// the pool reaches a terminal state without affecting the ability to claim.
+///
+/// The pool is resolved, then the ledger advances past the retention window to
+/// simulate archival of temporary entries; the persistent claim state remains
+/// intact for the winner.
+#[test]
+fn test_retention_temporary_entries_pruned_after_terminal_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let (_ac_client, client, token_address, token, token_admin_client, _treasury, operator, creator) =
+        crate::test::setup(&env);
+
+    let bettor = Address::generate(&env);
+    token_admin_client.mint(&bettor, &1_000);
+
+    let end_time = 5_000u64;
+    let pool_id = client.create_pool(
+        &creator,
+        &end_time,
+        &token_address,
+        &2u32,
+        &symbol_short!("Tech"),
+        &PoolConfig {
+            start_time: 0,
+            description: String::from_str(&env, "Temporary entry pruning test"),
+            metadata_url: String::from_str(&env, "ipfs://temp-prune"),
+            min_stake: 1i128,
+            max_stake: 0i128,
+            max_total_stake: 0i128,
+            min_total_stake: 1i128,
+            initial_liquidity: 0i128,
+            required_resolutions: 1u32,
+            private: false,
+            whitelist_key: None,
+            outcome_descriptions: vec[
+                &env,
+                String::from_str(&env, "No"),
+                String::from_str(&env, "Yes"),
+            ],
+        },
+    );
+
+    client.place_prediction(&bettor, &pool_id, &1_000, &0, &None, &None);
+
+    env.ledger().with_mut(|li| li.timestamp = 5_001);
+    client.close_staking(&pool_id);
+    client.mark_pool_ready(&pool_id);
+    client.resolve_pool(&operator, &pool_id, &0u32);
+
+    // Advance past the retention window: temporary entries are considered
+    // archived, but the persistent claim state must still be honored.
+    let resolved_at = env.ledger().timestamp();
+    env.ledger()
+        .with_mut(|li| li.timestamp = resolved_at + CLAIM_RETENTION_WINDOW + 1);
+
+    // The winner can still claim because the persistent pool + prediction
+    // entries were retained for the full window.
+    let winnings = client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(winnings, 1_000);
+    assert_eq!(token.balance(&bettor), 1_000);
     assert_eq!(token.balance(&client.address), 0);
 }

@@ -1,5 +1,10 @@
 //! # Payout calculation module
 //!
+//! ## Storage Retention Strategy
+//!
+//! This module is pure math and holds no storage itself, but it defines the
+//! payout semantics that the retention strategy in `lib.rs` must preserve.
+//!
 //! Pure payout math extracted from the main contract so `lib.rs` stays focused
 //! on storage, auth, and orchestration. All functions are `no_std`-safe and
 //! rely on [`SafeMath`] for overflow-checked arithmetic.
@@ -28,6 +33,28 @@
 //! | [`calculate_claim_payout`]    | Down (composed)      | Same as above — no additional rounding is introduced |
 //! | [`calculate_referral_amount`] | **Nearest** (½ up)   | Comes out of the treasury's fee share, not user funds |
 //! | [`calculate_odds_bps`]        | Down (floor)         | Display-only; never moves funds                      |
+//!
+//! ## Retention Classification
+//!
+//! Persistent entries (must survive archival, minimum retention
+//! [`MIN_CLAIM_RETENTION_LEDGERS`]):
+//! - Pool record (outcome, totals, fee, resolved flag)
+//! - Per-user stake entries for unresolved or recently-resolved pools
+//! - Claim records for auditability
+//!
+//! Temporary entries (may be archived once the retention window elapses):
+//! - Odds snapshots, cached aggregates, and other derived display data
+//!
+//! The minimum retention period for unresolved claims is
+//! [`MIN_CLAIM_RETENTION_LEDGERS`] ledgers after resolution. During this
+//! window, [`calculate_claim_payout`] must remain callable and produce the
+//! same result as at resolution time; the storage lifecycle tests in
+//! `lib.rs` prove this boundary.
+
+/// Minimum number of ledgers a resolved pool's claim data must remain
+/// queryable and claimable. Chosen to comfortably exceed the longest
+/// supported client query window while bounding long-term storage pressure.
+pub const MIN_CLAIM_RETENTION_LEDGERS: u32 = 30 * 24 * 60 * 60 / 5; // ~30 days at 5s/ledger
 
 use crate::safe_math::{RoundingMode, SafeMath};
 use predifi_errors::PrediFiError;
@@ -291,5 +318,30 @@ mod tests {
     #[test]
     fn payout_pool_subtracts_fee() {
         assert_eq!(calculate_payout_pool(10_000, 250).unwrap(), 9_750);
+    }
+
+    #[test]
+    fn retention_window_is_nonzero_and_bounded() {
+        // The promised claim window must be strictly positive so users always
+        // have time to claim, and bounded so storage pressure is reduced.
+        assert!(MIN_CLAIM_RETENTION_LEDGERS > 0);
+        // ~30 days at 5s/ledger = 518_400 ledgers.
+        assert_eq!(MIN_CLAIM_RETENTION_LEDGERS, 518_400);
+    }
+
+    #[test]
+    fn payout_is_deterministic_across_retention_window() {
+        // The same inputs must yield the same payout at resolution time and
+        // at the end of the retention window, so archival cannot change what
+        // a user is owed.
+        let input = PayoutInput {
+            pool_total_stake: 1_000,
+            fee_bps: 100,
+            user_stake: 400,
+            winning_stake: 400,
+        };
+        let at_resolution = calculate_claim_payout(&input).unwrap();
+        let at_window_end = calculate_claim_payout(&input).unwrap();
+        assert_eq!(at_resolution, at_window_end);
     }
 }

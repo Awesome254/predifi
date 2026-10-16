@@ -65,6 +65,98 @@ pub const BUMP_THRESHOLD: u32 = 14 * DAY_IN_LEDGERS;
 pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 
 // ═══════════════════════════════════════════════════════════════════════════
+// STORAGE RETENTION STRATEGY
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Persistent vs. temporary storage classification
+// ----------------------------------------------
+// Soroban offers two storage durability classes:
+//
+// * **Persistent** entries survive as long as their TTL is periodically extended.
+//   They are the canonical source of truth for claims, auditability, and client
+//   queries, so they MUST be extended while a pool is still actionable.
+// * **Temporary** entries are cheap and expire automatically without any bump.
+//   They are only suitable for data that can be safely regenerated or that is
+//   only meaningful for a short window (rate-limit markers, caches, etc.).
+//
+// The PrediFi contract classifies its state as follows:
+//
+// Persistent (must be retained for the full claim window):
+//   - `Pool` records (including `outcome`, `end_time`, `resolved_at`).
+//   - Per-user `Position` / `UserStake` entries (required to claim).
+//   - `OutStakes` batch entries for pools with >= 16 outcomes.
+//   - `Config`, `Admin`, `Operators`, `ContractVersion` (instance storage).
+//
+// Temporary (may expire without affecting claims):
+//   - `LastPredictionTime(user)` cooldown markers.
+//   - Any future caches, price snapshots, or derived indexes.
+//
+// Archival / TTL behavior
+// -----------------------
+// Persistent entries are bumped using `BUMP_THRESHOLD` / `BUMP_AMOUNT` above.
+// Once a pool is fully resolved AND the claim window has elapsed, its entries
+// become eligible for archival: the contract stops extending them and lets the
+// TTL lapse naturally. Archived entries remain recoverable via Soroban's
+// restore mechanism, preserving auditability without paying ongoing rent.
+//
+// Minimum retention period for unresolved claims
+// ----------------------------------------------
+// A resolved pool MUST keep its persistent entries alive for at least
+// `CLAIM_WINDOW_LEDGERS` after `resolved_at`. This guarantees that every user
+// who is entitled to a payout can still call `claim` during the promised
+// window, even if the contract is otherwise idle. The window is deliberately
+// longer than `BUMP_AMOUNT` so that a single bump at resolution time is
+// sufficient to cover the entire claim period.
+
+/// Minimum retention period for claimable pool data after resolution.
+///
+/// **Units:** Ledgers (dimensionless)
+/// **Value:** 1,555,200 ledgers (90 days)
+///
+/// **Rationale:** After a pool is resolved, users must be given a guaranteed
+/// window during which their positions remain claimable. 90 days is long enough
+/// to accommodate inactive users, wallet recovery, and dispute resolution, while
+/// still allowing the contract to eventually stop paying storage rent on pools
+/// that everyone has already claimed. This value MUST be greater than
+/// `BUMP_AMOUNT` so that a single TTL extension performed at resolution time
+/// covers the entire claim window without requiring further bumps.
+///
+/// **Impact of changes:**
+/// - Increasing this value extends the guaranteed claim window but increases
+///   the minimum storage cost per resolved pool.
+/// - Decreasing this value shortens the claim window and risks users losing
+///   access to their funds if they claim late.
+/// - Must remain strictly greater than `BUMP_AMOUNT`; otherwise the TTL set at
+///   resolution could expire before the claim window ends.
+///
+/// **Used for:** Determining when resolved pool entries become eligible for
+/// archival, and validating that the claim window is covered by a single bump.
+pub const CLAIM_WINDOW_LEDGERS: u32 = 90 * DAY_IN_LEDGERS;
+
+/// Retention period for temporary entries (e.g. cooldown markers).
+///
+/// **Units:** Ledgers (dimensionless)
+/// **Value:** 17,280 ledgers (1 day)
+///
+/// **Rationale:** Temporary entries such as `LastPredictionTime(user)` only need
+/// to outlive the longest possible cooldown. One day is comfortably longer than
+/// any sane `prediction_cooldown_seconds` value while keeping temporary storage
+/// cheap and self-cleaning. Entries that expire can be safely recreated on the
+/// next interaction, so no data is lost.
+///
+/// **Impact of changes:**
+/// - Increasing this value keeps temporary entries around longer, slightly
+///   increasing storage cost but reducing the chance of a cooldown being reset
+///   by expiry.
+/// - Decreasing this value below the configured cooldown would allow users to
+///   bypass rate limiting by waiting for the marker to expire.
+/// - Must be >= the maximum supported `prediction_cooldown_seconds` expressed
+///   in ledgers.
+///
+/// **Used for:** Setting the TTL on temporary storage entries.
+pub const TEMPORARY_ENTRY_TTL_LEDGERS: u32 = DAY_IN_LEDGERS;
+
+// ═══════════════════════════════════════════════════════════════════════════
 // POOL CONFIGURATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -495,6 +587,24 @@ mod tests {
     #[test]
     fn test_bump_amount_is_30_days() {
         assert_eq!(BUMP_AMOUNT, 30 * DAY_IN_LEDGERS);
+    }
+
+    #[test]
+    fn test_claim_window_covers_bump_amount() {
+        // A single TTL extension at resolution time must cover the entire
+        // promised claim window, otherwise users could lose the ability to
+        // claim before the window ends.
+        assert!(CLAIM_WINDOW_LEDGERS > BUMP_AMOUNT);
+    }
+
+    #[test]
+    fn test_claim_window_is_90_days() {
+        assert_eq!(CLAIM_WINDOW_LEDGERS, 90 * DAY_IN_LEDGERS);
+    }
+
+    #[test]
+    fn test_temporary_entry_ttl_is_one_day() {
+        assert_eq!(TEMPORARY_ENTRY_TTL_LEDGERS, DAY_IN_LEDGERS);
     }
 
     #[test]
