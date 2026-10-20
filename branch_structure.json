@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-30-contracts-define-a-retention-strategy-for",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-30-contracts-define-a-retention-strategy-for": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-30-contracts-define-a-retention-strategy-for",
+    "origin"
+  ]
+}
